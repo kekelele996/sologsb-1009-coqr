@@ -49,6 +49,48 @@ interface VersionSnapshot {
   glossary: GlossaryTerm[];
 }
 
+interface ReviewFile {
+  schema: 1;
+  kind: "sologsb-1009-review";
+  chapterId: string;
+  title: string;
+  exportedAt: string;
+  base: ContentBlock[];
+  blocks: ContentBlock[];
+  glossary: GlossaryTerm[];
+  note?: string;
+}
+
+interface MergeArchive {
+  id: string;
+  mergedAt: string;
+  chapterId: string;
+  chapterTitle: string;
+  before: ChapterProject;
+  returnFile: ReviewFile;
+  summary: string;
+}
+
+type MergeStatus =
+  | "unchanged"
+  | "ours"
+  | "theirs"
+  | "conflict"
+  | "added-ours"
+  | "added-theirs"
+  | "deleted-theirs"
+  | "deleted-ours";
+
+interface MergeRow {
+  key: string;
+  status: MergeStatus;
+  base?: ContentBlock;
+  ours?: ContentBlock;
+  theirs?: ContentBlock;
+  merged?: ContentBlock;
+  choice?: "ours" | "theirs";
+}
+
 interface ChapterProject {
   id: string;
   title: string;
@@ -71,6 +113,7 @@ interface AccessibilityIssue {
 }
 
 const STORAGE_KEY = "sologsb-1009-accessible-textbook-v1";
+const ARCHIVE_STORAGE_KEY = "sologsb-1009-merge-archives-v1";
 const uid = (prefix: string) => `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
 
 function createSeedProject(): ChapterProject {
@@ -388,6 +431,258 @@ function download(filename: string, content: string, type = "text/html;charset=u
   URL.revokeObjectURL(url);
 }
 
+// === 回稿对账合并 ===
+
+function blockContentEquals(a: ContentBlock | undefined, b: ContentBlock | undefined): boolean {
+  if (!a || !b) return a === b;
+  if (a.type !== b.type) return false;
+  if (a.text !== b.text) return false;
+  if (a.accessibleText !== b.accessibleText) return false;
+  if ((a.imageAlt ?? "") !== (b.imageAlt ?? "")) return false;
+  if ((a.linkHref ?? "") !== (b.linkHref ?? "")) return false;
+  if ((a.headingLevel ?? 0) !== (b.headingLevel ?? 0)) return false;
+  if ((a.imageSrc ?? "") !== (b.imageSrc ?? "")) return false;
+  return true;
+}
+
+function adoptContent(target: ContentBlock, source: ContentBlock): ContentBlock {
+  return {
+    ...target,
+    type: source.type,
+    text: source.text,
+    accessibleText: source.accessibleText,
+    imageAlt: source.imageAlt,
+    linkHref: source.linkHref,
+    headingLevel: source.headingLevel,
+    imageSrc: source.imageSrc,
+  };
+}
+
+function normalizeAdded(block: ContentBlock): ContentBlock {
+  return {
+    ...block,
+    changeReason: block.changeReason ?? "",
+    reviewStatus: block.reviewStatus ?? "pending",
+    comments: block.comments ?? [],
+  };
+}
+
+function reconcileThreeWay(base: ContentBlock[], ours: ContentBlock[], theirs: ContentBlock[]): MergeRow[] {
+  const baseMap = new Map(base.map((block) => [block.id, block]));
+  const oursMap = new Map(ours.map((block) => [block.id, block]));
+  const theirsMap = new Map(theirs.map((block) => [block.id, block]));
+  const ids = new Set([...baseMap.keys(), ...oursMap.keys(), ...theirsMap.keys()]);
+  const rows: MergeRow[] = [];
+  for (const id of ids) {
+    const b = baseMap.get(id);
+    const o = oursMap.get(id);
+    const t = theirsMap.get(id);
+    if (b && o && t) {
+      const oursChanged = !blockContentEquals(o, b);
+      const theirsChanged = !blockContentEquals(t, b);
+      if (!oursChanged && !theirsChanged) rows.push({ key: id, status: "unchanged", base: b, ours: o, theirs: t, merged: o });
+      else if (oursChanged && !theirsChanged) rows.push({ key: id, status: "ours", base: b, ours: o, theirs: t, merged: o });
+      else if (!oursChanged && theirsChanged) rows.push({ key: id, status: "theirs", base: b, ours: o, theirs: t, merged: adoptContent({ ...o }, t) });
+      else if (blockContentEquals(o, t)) rows.push({ key: id, status: "unchanged", base: b, ours: o, theirs: t, merged: o });
+      else rows.push({ key: id, status: "conflict", base: b, ours: o, theirs: t, choice: "ours" });
+    } else if (b && o && !t) {
+      const oursChanged = !blockContentEquals(o, b);
+      if (!oursChanged) rows.push({ key: id, status: "deleted-theirs", base: b, ours: o });
+      else rows.push({ key: id, status: "conflict", base: b, ours: o, choice: "ours" });
+    } else if (b && !o && t) {
+      const theirsChanged = !blockContentEquals(t, b);
+      if (!theirsChanged) rows.push({ key: id, status: "deleted-ours", base: b, theirs: t });
+      else rows.push({ key: id, status: "conflict", base: b, theirs: t, choice: "theirs" });
+    } else if (!b && o && t) {
+      if (blockContentEquals(o, t)) rows.push({ key: id, status: "added-ours", ours: o, theirs: t, merged: o });
+      else rows.push({ key: id, status: "conflict", ours: o, theirs: t, choice: "ours" });
+    } else if (!b && o && !t) {
+      rows.push({ key: id, status: "added-ours", ours: o, merged: o });
+    } else if (!b && !o && t) {
+      rows.push({ key: id, status: "added-theirs", theirs: t, merged: normalizeAdded(t) });
+    }
+  }
+  return rows;
+}
+
+function reconcileTwoWay(ours: ContentBlock[], theirs: ContentBlock[]): MergeRow[] {
+  const oursMap = new Map(ours.map((block) => [block.id, block]));
+  const theirsMap = new Map(theirs.map((block) => [block.id, block]));
+  const ids = new Set([...oursMap.keys(), ...theirsMap.keys()]);
+  const rows: MergeRow[] = [];
+  for (const id of ids) {
+    const o = oursMap.get(id);
+    const t = theirsMap.get(id);
+    if (o && t) {
+      if (blockContentEquals(o, t)) rows.push({ key: id, status: "unchanged", ours: o, theirs: t, merged: o });
+      else rows.push({ key: id, status: "conflict", ours: o, theirs: t, choice: "ours" });
+    } else if (o) {
+      rows.push({ key: id, status: "added-ours", ours: o, merged: o });
+    } else if (t) {
+      rows.push({ key: id, status: "added-theirs", theirs: t, merged: normalizeAdded(t) });
+    }
+  }
+  return rows;
+}
+
+function buildMergedBlocks(rows: MergeRow[], oursOrder: ContentBlock[]): ContentBlock[] {
+  const rowMap = new Map(rows.map((row) => [row.key, row]));
+  const result: ContentBlock[] = [];
+  for (const o of oursOrder) {
+    const row = rowMap.get(o.id);
+    if (!row) continue;
+    if (row.status === "deleted-theirs" || row.status === "deleted-ours") continue;
+    if (row.status === "conflict") {
+      if (row.choice === "ours") {
+        if (row.ours) result.push(row.ours);
+      } else if (row.theirs) {
+        const target = row.ours ? { ...row.ours } : normalizeAdded({ ...row.theirs });
+        result.push(adoptContent(target, row.theirs));
+      }
+    } else if (row.merged) {
+      result.push(row.merged);
+    }
+  }
+  for (const row of rows) {
+    if (row.status === "added-theirs" && row.merged) result.push(row.merged);
+  }
+  return result;
+}
+
+function contentPreview(block: ContentBlock | undefined): string {
+  if (!block) return "（无）";
+  const text = block.type === "image" ? (block.imageAlt || block.accessibleText || block.text) : (block.accessibleText || block.text);
+  return text.length > 140 ? `${text.slice(0, 140)}…` : text;
+}
+
+function mergeStatusLabel(status: MergeStatus): string {
+  switch (status) {
+    case "unchanged": return "无改动";
+    case "ours": return "仅编辑改动 · 照编辑稿";
+    case "theirs": return "仅教研组改动 · 照回稿";
+    case "conflict": return "冲突 · 需选择";
+    case "added-ours": return "编辑新增";
+    case "added-theirs": return "教研组新增";
+    case "deleted-theirs": return "教研组删除";
+    case "deleted-ours": return "编辑删除";
+  }
+}
+
+function exportReviewCopy() {
+  const data: ReviewFile = {
+    schema: 1,
+    kind: "sologsb-1009-review",
+    chapterId: project.id,
+    title: project.title,
+    exportedAt: new Date().toISOString(),
+    base: structuredClone(project.blocks),
+    blocks: structuredClone(project.blocks),
+    glossary: structuredClone(project.glossary),
+    note: "审校说明：请在 blocks 中修改段落的 text（原文）或 accessibleText（无障碍表达），不要改动 id 与章节编号。改完后将本文件发回，使用“导入回稿”按段落对账合并。",
+  };
+  download(`${project.title}-审校稿.json`, JSON.stringify(data, null, 2), "application/json;charset=utf-8");
+  document.documentElement.dataset.lastAction = "已导出审校稿";
+}
+
+async function parseReturnFile(file: File): Promise<{ ok: true; data: ReviewFile; baseMissing: boolean } | { ok: false; reason: string }> {
+  let text: string;
+  try { text = await file.text(); } catch { return { ok: false, reason: "无法读取回稿文件。请重新选择文件。草稿未改动。" }; }
+  let raw: unknown;
+  try { raw = JSON.parse(text); } catch { return { ok: false, reason: "回稿不是有效的 JSON 文件。请选择导出审校稿时下载的 `.json` 回稿文件（不要改文件格式或扩展名）。草稿未改动。" }; }
+  if (typeof raw !== "object" || raw === null) return { ok: false, reason: "回稿格式不正确：文件内容不是有效的审校稿结构。草稿未改动。" };
+  const r = raw as Record<string, unknown>;
+  if (r.kind !== "sologsb-1009-review") return { ok: false, reason: "回稿格式不正确：这不是本工作台导出的审校稿文件（缺少审校稿标识）。可能选错了文件，或文件被另存为其他格式。草稿未改动。请确认后重新导入。" };
+  if (r.schema !== 1) return { ok: false, reason: `回稿版本不兼容：审校稿格式版本为 ${String(r.schema)}，当前工作台需要版本 1。草稿未改动。` };
+  if (typeof r.chapterId !== "string" || !Array.isArray(r.blocks)) return { ok: false, reason: "回稿格式不正确：缺少章节编号或段落内容。草稿未改动。" };
+  const retBlocks = r.blocks as ContentBlock[];
+  if (!retBlocks.length) return { ok: false, reason: "回稿中没有任何段落内容，无法合并。草稿未改动。" };
+  if (r.chapterId !== project.id) {
+    const retTitle = typeof r.title === "string" ? r.title : "未命名章节";
+    return { ok: false, reason: `回稿章节不匹配：回稿来自《${retTitle}》（章节编号 ${r.chapterId}），当前草稿是《${project.title}》。这不是同一章的回稿，草稿未改动。请确认选择了正确的回稿文件后重新导入。` };
+  }
+  const matched = project.blocks.filter((block) => retBlocks.some((ret) => ret.id === block.id)).length;
+  if (project.blocks.length > 0 && matched < project.blocks.length * 0.5) {
+    return { ok: false, reason: `回稿与当前草稿对不上：回稿 ${retBlocks.length} 段中只有 ${matched} 段能与当前草稿（共 ${project.blocks.length} 段）按编号对应。可能回稿不是这一章的，或章节已被大幅改动。草稿未改动。请确认后重新导入。` };
+  }
+  let base: ContentBlock[] = [];
+  let baseMissing = false;
+  if (Array.isArray(r.base) && (r.base as ContentBlock[]).length) base = r.base as ContentBlock[];
+  else baseMissing = true;
+  const data: ReviewFile = {
+    schema: 1,
+    kind: "sologsb-1009-review",
+    chapterId: r.chapterId,
+    title: typeof r.title === "string" ? r.title : project.title,
+    exportedAt: typeof r.exportedAt === "string" ? r.exportedAt : "",
+    base,
+    blocks: retBlocks,
+    glossary: Array.isArray(r.glossary) ? r.glossary as GlossaryTerm[] : [],
+  };
+  return { ok: true, data, baseMissing };
+}
+
+function loadArchives(): MergeArchive[] {
+  try {
+    const raw = JSON.parse(localStorage.getItem(ARCHIVE_STORAGE_KEY) ?? "[]") as MergeArchive[];
+    if (Array.isArray(raw)) return raw;
+  } catch { /* ignore */ }
+  return [];
+}
+
+function saveArchives(archives: MergeArchive[]) {
+  localStorage.setItem(ARCHIVE_STORAGE_KEY, JSON.stringify(archives.slice(0, 10)));
+}
+
+function applyMerge(rows: MergeRow[], returnFile: ReviewFile) {
+  const mergedBlocks = buildMergedBlocks(rows, project.blocks);
+  const counts = {
+    unchanged: rows.filter((r) => r.status === "unchanged").length,
+    ours: rows.filter((r) => r.status === "ours").length,
+    theirs: rows.filter((r) => r.status === "theirs").length,
+    conflict: rows.filter((r) => r.status === "conflict").length,
+    added: rows.filter((r) => r.status === "added-ours" || r.status === "added-theirs").length,
+    deleted: rows.filter((r) => r.status === "deleted-theirs" || r.status === "deleted-ours").length,
+  };
+  const summary = `无改动 ${counts.unchanged} · 仅编辑改动 ${counts.ours} · 仅教研组改动 ${counts.theirs} · 冲突 ${counts.conflict} · 新增 ${counts.added} · 删除 ${counts.deleted}`;
+  const archive: MergeArchive = {
+    id: uid("merge"),
+    mergedAt: new Date().toISOString(),
+    chapterId: project.id,
+    chapterTitle: project.title,
+    before: structuredClone(project),
+    returnFile,
+    summary,
+  };
+  const archives = [archive, ...loadArchives()];
+  saveArchives(archives);
+  commit("回稿对账合并", (draft) => {
+    draft.blocks = mergedBlocks;
+    draft.blocks.forEach((block) => {
+      if (!block.comments) block.comments = [];
+      if (block.reviewStatus === undefined) block.reviewStatus = "pending";
+    });
+  });
+  lastMergeSummary = summary;
+  showMergeDialog = false;
+  showMergeDone = true;
+  render();
+}
+
+function restoreMerge(archiveId: string) {
+  const archives = loadArchives();
+  const archive = archives.find((item) => item.id === archiveId);
+  if (!archive) return;
+  commit("撤回回稿合并", (draft) => {
+    draft.blocks = structuredClone(archive.before.blocks);
+    draft.glossary = structuredClone(archive.before.glossary);
+    draft.title = archive.before.title;
+  });
+  saveArchives(archives.filter((item) => item.id !== archiveId));
+  showArchiveDialog = false;
+  showMergeDone = false;
+  render();
+}
+
 function loadProject(): ChapterProject {
   try {
     const stored = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "") as { schema: number; project: ChapterProject };
@@ -411,6 +706,15 @@ let showGlossary = false;
 let undoStack: ChapterProject[] = [];
 let redoStack: ChapterProject[] = [];
 let saveTimer = 0;
+let showMergeDialog = false;
+let showArchiveDialog = false;
+let showMergeDone = false;
+let showReturnError = false;
+let returnErrorReason = "";
+let mergeRows: MergeRow[] = [];
+let mergeReturnFile: ReviewFile | null = null;
+let mergeBaseMissing = false;
+let lastMergeSummary = "";
 
 const activeBlock = () => project.blocks.find((block) => block.id === activeBlockId) ?? project.blocks[0];
 const issues = () => analyze(project);
@@ -480,6 +784,9 @@ function render() {
           <sl-button size="small" variant="default" ${undoStack.length ? "" : "disabled"} data-action="undo">撤销</sl-button>
           <sl-button size="small" variant="default" ${redoStack.length ? "" : "disabled"} data-action="redo">重做</sl-button>
           <sl-button size="small" variant="default" data-action="glossary">术语表</sl-button>
+          <sl-button size="small" variant="default" outline data-action="export-review">导出审校稿</sl-button>
+          <sl-button size="small" variant="default" data-action="import-return">导入回稿</sl-button>
+          <sl-button size="small" variant="text" data-action="show-archive">合并留档</sl-button>
           <sl-button size="small" variant="primary" data-action="save-version">保存版本</sl-button>
           <sl-button size="small" variant="success" data-action="export">导出无障碍 HTML</sl-button>
         </div>
@@ -510,7 +817,9 @@ function render() {
             }).join("")}
           </div>
           <input id="chapter-file" type="file" accept=".txt,.md,.markdown" hidden />
+          <input id="return-file" type="file" accept=".json,application/json" hidden />
           <sl-button class="import-button" variant="default" data-action="import">导入章节文本</sl-button>
+          <sl-button class="import-button" variant="primary" outline data-action="import-return">导入教研组回稿</sl-button>
           <div class="keyboard-note"><b>键盘</b><span><kbd>J</kbd><kbd>K</kbd> 跳转问题</span><span><kbd>E</kbd> 自动改写</span><span><kbd>⌘ Z</kbd> 撤销</span><span><kbd>1</kbd><kbd>2</kbd> 预览模式</span></div>
         </aside>
 
@@ -598,6 +907,101 @@ function render() {
       </div>
       <div class="term-add"><sl-input id="new-term-source" placeholder="原文术语"></sl-input><sl-input id="new-term-preferred" placeholder="统一表达"></sl-input><sl-button variant="primary" data-action="add-term">添加术语</sl-button></div>
       <sl-button slot="footer" variant="primary" data-action="close-glossary">完成</sl-button>
+    </sl-dialog>
+
+    <sl-dialog label="回稿对账合并" ${showMergeDialog ? "open" : ""} data-dialog="merge" class="merge-dialog">
+      ${mergeReturnFile ? `
+        <div class="merge-summary">
+          <sl-alert variant="primary" open>
+            <sl-icon slot="icon" name="info-circle"></sl-icon>
+            已核对章节：《${escapeHtml(mergeReturnFile.title)}》。回稿 ${mergeReturnFile.blocks.length} 段 · 当前草稿 ${project.blocks.length} 段。${mergeBaseMissing ? "<b>未找到寄出时的基准快照，已按两方对账处理，所有不同段落均按冲突处理。</b>" : "已按寄出快照进行三方对账：仅一方改动的照那边走，两边都改的标为冲突。"}
+          </sl-alert>
+          <div class="merge-counts">
+            <span class="pill unchanged">无改动 ${mergeRows.filter((r) => r.status === "unchanged").length}</span>
+            <span class="pill ours">仅编辑改动 ${mergeRows.filter((r) => r.status === "ours").length}</span>
+            <span class="pill theirs">仅教研组改动 ${mergeRows.filter((r) => r.status === "theirs").length}</span>
+            <span class="pill conflict">冲突 ${mergeRows.filter((r) => r.status === "conflict").length}</span>
+            <span class="pill added">新增 ${mergeRows.filter((r) => r.status === "added-ours" || r.status === "added-theirs").length}</span>
+            <span class="pill deleted">删除 ${mergeRows.filter((r) => r.status === "deleted-theirs" || r.status === "deleted-ours").length}</span>
+          </div>
+        </div>
+        <div class="merge-rows">
+          ${mergeRows.map((row, index) => {
+            const block = row.ours ?? row.theirs;
+            const role = block ? blockRole(block) : "段落";
+            const oursIndex = row.ours ? project.blocks.findIndex((b) => b.id === row.key) + 1 : 0;
+            const num = oursIndex || index + 1;
+            if (row.status === "conflict") {
+              return `<div class="merge-row conflict">
+                <div class="merge-row-head">
+                  <span class="merge-row-num">段 ${num}</span>
+                  <span class="merge-row-role">${role}</span>
+                  <span class="merge-badge conflict">${mergeStatusLabel(row.status)}</span>
+                </div>
+                <div class="merge-conflict">
+                  <label class="merge-choice ${row.choice === "ours" ? "selected" : ""}">
+                    <input type="radio" name="merge-${CSS.escape(row.key)}" value="ours" ${row.choice === "ours" ? "checked" : ""} data-action="pick-merge" data-row-key="${escapeHtml(row.key)}" data-choice="ours">
+                    <span class="merge-choice-label">编辑稿（当前草稿）</span>
+                    <span class="merge-choice-body">${escapeHtml(row.ours ? contentPreview(row.ours) : "（编辑已删除该段）")}</span>
+                  </label>
+                  <label class="merge-choice ${row.choice === "theirs" ? "selected" : ""}">
+                    <input type="radio" name="merge-${CSS.escape(row.key)}" value="theirs" ${row.choice === "theirs" ? "checked" : ""} data-action="pick-merge" data-row-key="${escapeHtml(row.key)}" data-choice="theirs">
+                    <span class="merge-choice-label">教研组回稿</span>
+                    <span class="merge-choice-body">${escapeHtml(row.theirs ? contentPreview(row.theirs) : "（教研组已删除该段）")}</span>
+                  </label>
+                </div>
+              </div>`;
+            }
+            return `<div class="merge-row ${row.status}">
+              <div class="merge-row-head">
+                <span class="merge-row-num">段 ${num}</span>
+                <span class="merge-row-role">${role}</span>
+                <span class="merge-badge ${row.status}">${mergeStatusLabel(row.status)}</span>
+              </div>
+              <div class="merge-result-body">${escapeHtml(contentPreview(row.merged ?? row.ours ?? row.theirs))}</div>
+            </div>`;
+          }).join("")}
+        </div>
+        <div class="merge-archive-note">合并前会自动把当前草稿与回稿分别留档；合并后可在“合并留档”中撤回，或用 Ctrl/⌘+Z 撤销。</div>
+        <sl-button slot="footer" variant="default" data-action="cancel-merge">取消</sl-button>
+        <sl-button slot="footer" variant="primary" data-action="confirm-merge">确认合并</sl-button>
+      ` : ""}
+    </sl-dialog>
+
+    <sl-dialog label="合并留档" ${showArchiveDialog ? "open" : ""} data-dialog="archive" class="archive-dialog">
+      <div class="archive-list">
+        ${loadArchives().length ? loadArchives().map((item) => `
+          <div class="archive-item">
+            <div class="archive-item-head"><b>${escapeHtml(item.chapterTitle)}</b><time>${new Date(item.mergedAt).toLocaleString()}</time></div>
+            <div class="archive-item-summary">${escapeHtml(item.summary)}</div>
+            <div class="archive-item-actions">
+              <sl-button size="small" variant="danger" outline data-action="restore-merge" data-archive-id="${escapeHtml(item.id)}">撤回本次合并</sl-button>
+            </div>
+          </div>`).join("") : `<div class="empty-note">还没有合并记录。导入回稿并确认合并后，会在这里分别留档当前草稿与回稿，可随时撤回。</div>`}
+      </div>
+      <sl-button slot="footer" variant="primary" data-action="close-archive">完成</sl-button>
+    </sl-dialog>
+
+    <sl-dialog label="合并完成" ${showMergeDone ? "open" : ""} data-dialog="merge-done" class="merge-done-dialog">
+      <sl-alert variant="success" open>
+        <sl-icon slot="icon" name="check-circle"></sl-icon>
+        回稿已按段落对账合并完成。编辑的审核状态、批注与术语统一均已保留。
+      </sl-alert>
+      <div class="merge-done-summary">${escapeHtml(lastMergeSummary)}</div>
+      <div class="merge-archive-note">合并前的草稿与回稿已分别留档，可在“合并留档”中撤回，或立即用 Ctrl/⌘+Z 撤销。</div>
+      <sl-button slot="footer" variant="default" data-action="undo-merge-now">撤回本次合并</sl-button>
+      <sl-button slot="footer" variant="primary" data-action="close-merge-done">完成</sl-button>
+    </sl-dialog>
+
+    <sl-dialog label="回稿未导入" ${showReturnError ? "open" : ""} data-dialog="return-error" class="return-error-dialog">
+      <sl-alert variant="warning" open>
+        <sl-icon slot="icon" name="exclamation-triangle"></sl-icon>
+        草稿未改动
+      </sl-alert>
+      <p class="return-error-reason">${escapeHtml(returnErrorReason)}</p>
+      <div class="merge-archive-note">请确认回稿文件来自当前章节的审校稿，然后重新导入。</div>
+      <sl-button slot="footer" variant="default" data-action="close-return-error">取消</sl-button>
+      <sl-button slot="footer" variant="primary" data-action="reimport-return">重新导入</sl-button>
     </sl-dialog>`;
 
   wireLiveFields();
@@ -758,6 +1162,33 @@ app.addEventListener("click", (event) => {
     render();
   }
   if (action === "import") app.querySelector<HTMLInputElement>("#chapter-file")?.click();
+  if (action === "export-review") exportReviewCopy();
+  if (action === "import-return") app.querySelector<HTMLInputElement>("#return-file")?.click();
+  if (action === "show-archive") { showArchiveDialog = true; render(); }
+  if (action === "cancel-merge") { showMergeDialog = false; render(); }
+  if (action === "confirm-merge") { if (mergeReturnFile) applyMerge(mergeRows, mergeReturnFile); }
+  if (action === "pick-merge") {
+    const rowKey = target.dataset.rowKey ?? "";
+    const choice = (target.dataset.choice ?? "ours") as "ours" | "theirs";
+    const row = mergeRows.find((item) => item.key === rowKey);
+    if (row) { row.choice = choice; render(); }
+  }
+  if (action === "close-archive") { showArchiveDialog = false; render(); }
+  if (action === "restore-merge") {
+    const archiveId = target.dataset.archiveId ?? "";
+    restoreMerge(archiveId);
+  }
+  if (action === "close-merge-done") { showMergeDone = false; render(); }
+  if (action === "undo-merge-now") {
+    const latest = loadArchives()[0];
+    if (latest) restoreMerge(latest.id);
+    else { showMergeDone = false; render(); }
+  }
+  if (action === "close-return-error") { showReturnError = false; render(); }
+  if (action === "reimport-return") {
+    showReturnError = false;
+    app.querySelector<HTMLInputElement>("#return-file")?.click();
+  }
 });
 
 app.addEventListener("sl-change", (event) => {
@@ -788,6 +1219,40 @@ app.addEventListener("change", (event) => {
       activeIssueId = "";
     });
   });
+});
+
+app.addEventListener("change", (event) => {
+  const input = event.target as HTMLInputElement;
+  if (input.id !== "return-file" || !input.files?.[0]) return;
+  const file = input.files[0];
+  void parseReturnFile(file).then((result) => {
+    input.value = "";
+    if (!result.ok) {
+      returnErrorReason = result.reason;
+      showReturnError = true;
+      render();
+      return;
+    }
+    mergeReturnFile = result.data;
+    mergeBaseMissing = result.baseMissing;
+    mergeRows = result.baseMissing
+      ? reconcileTwoWay(project.blocks, result.data.blocks)
+      : reconcileThreeWay(result.data.base, project.blocks, result.data.blocks);
+    showMergeDialog = true;
+    render();
+  });
+});
+
+let syncingDialogs = false;
+app.addEventListener("sl-after-hide", (event) => {
+  if (syncingDialogs) return;
+  const dialog = (event.target as HTMLElement).closest?.("sl-dialog");
+  if (!dialog) return;
+  const name = (dialog as HTMLElement).dataset.dialog;
+  if (name === "merge" && showMergeDialog) { showMergeDialog = false; render(); }
+  else if (name === "archive" && showArchiveDialog) { showArchiveDialog = false; render(); }
+  else if (name === "merge-done" && showMergeDone) { showMergeDone = false; render(); }
+  else if (name === "return-error" && showReturnError) { showReturnError = false; render(); }
 });
 
 app.addEventListener("input", (event) => {

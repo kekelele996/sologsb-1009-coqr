@@ -170,3 +170,45 @@ sl-textarea::part(textarea) { line-height: 1.65; }
   .workspace { grid-template-columns: 245px minmax(520px, 1fr) 370px; }
   .online-pill { display: none; }
 }
+
+/* === 回稿对账合并 === */
+.merge-dialog::part(panel) { max-width: 880px; width: 92vw; }
+.merge-summary { display: grid; gap: 10px; margin-bottom: 12px; }
+.merge-counts { display: flex; flex-wrap: wrap; gap: 6px; }
+.merge-counts .pill { padding: 4px 10px; border-radius: 99px; font-size: 11px; font-weight: 700; background: #eef1ef; color: #5a6861; }
+.merge-counts .pill.unchanged { background: #eef1ef; color: #5a6861; }
+.merge-counts .pill.ours { background: #e7f1f8; color: #1f5e8b; }
+.merge-counts .pill.theirs { background: #f3eaf7; color: #6d3d8a; }
+.merge-counts .pill.conflict { background: #fbe9e7; color: #a72f27; }
+.merge-counts .pill.added { background: #e6f4ec; color: #287a55; }
+.merge-counts .pill.deleted { background: #f0e7e2; color: #8a5a3b; }
+.merge-rows { display: grid; gap: 8px; max-height: 52vh; overflow-y: auto; padding-right: 4px; }
+.merge-row { border: 1px solid #e0e4e2; border-radius: 10px; padding: 10px 12px; background: #fff; }
+.merge-row.conflict { border-color: #e6b8b2; background: #fffaf9; }
+.merge-row-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.merge-row-num { font: 700 10px ui-monospace, monospace; color: #61706a; background: #eef1ef; border-radius: 5px; padding: 2px 6px; }
+.merge-row-role { color: #5d6a64; font-size: 10px; font-weight: 700; letter-spacing: .04em; }
+.merge-badge { margin-left: auto; padding: 2px 8px; border-radius: 99px; font-size: 10px; font-weight: 700; background: #eef1ef; color: #5a6861; }
+.merge-badge.ours { background: #e7f1f8; color: #1f5e8b; }
+.merge-badge.theirs { background: #f3eaf7; color: #6d3d8a; }
+.merge-badge.conflict { background: #fbe9e7; color: #a72f27; }
+.merge-badge.added-ours, .merge-badge.added-theirs { background: #e6f4ec; color: #287a55; }
+.merge-badge.deleted-theirs, .merge-badge.deleted-ours { background: #f0e7e2; color: #8a5a3b; }
+.merge-result-body { color: #33413c; font-size: 12px; line-height: 1.6; white-space: pre-wrap; word-break: break-word; }
+.merge-conflict { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.merge-choice { display: grid; grid-template-columns: auto 1fr; grid-template-rows: auto 1fr; gap: 2px 8px; align-items: start; border: 1px solid #d7ddd9; border-radius: 8px; padding: 8px 10px; background: #fff; cursor: pointer; }
+.merge-choice:hover { border-color: #9fc5b3; }
+.merge-choice.selected { border-color: #2e785c; background: #f2f9f5; box-shadow: inset 2px 0 #2e785c; }
+.merge-choice input { grid-row: 1; margin: 3px 0 0; accent-color: #2e785c; }
+.merge-choice-label { grid-column: 2; font-size: 11px; font-weight: 700; color: #2f3d38; }
+.merge-choice-body { grid-column: 1 / -1; color: #4a5953; font-size: 11px; line-height: 1.55; white-space: pre-wrap; word-break: break-word; }
+.merge-archive-note { margin-top: 12px; padding: 9px 12px; border: 1px dashed #d4dad7; border-radius: 8px; color: #6d7a74; font-size: 11px; line-height: 1.5; background: #fafbf9; }
+.archive-list { display: grid; gap: 8px; max-height: 56vh; overflow-y: auto; }
+.archive-item { border: 1px solid #e0e4e2; border-radius: 10px; padding: 10px 12px; background: #fff; }
+.archive-item-head { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; }
+.archive-item-head b { font-size: 12px; }
+.archive-item-head time { color: #7b8580; font-size: 10px; }
+.archive-item-summary { color: #5d6a64; font-size: 11px; margin: 5px 0 8px; }
+.archive-item-actions { display: flex; justify-content: flex-end; }
+.return-error-reason { margin: 10px 0 0; color: #8a5209; font-size: 12px; line-height: 1.6; }
+.merge-done-summary { margin: 10px 0 0; color: #2f3d38; font-size: 12px; font-weight: 700; }
